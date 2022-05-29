@@ -130,7 +130,7 @@ func (deployer *Deployer) handleDescription(desc *appsapi.Description) error {
 	}
 
 	if !utils.DeployableByAgent(deployer.syncMode, deployer.appPusherEnabled) {
-		klog.V(5).Infof("Description %s is not deployable by agent, skipping syncing", klog.KObj(desc))
+		klog.Infof("Description %s is not deployable by agent, skipping syncing", klog.KObj(desc))
 		return utils.ApplyDescription(context.TODO(), deployer.clusternetClient, deployer.dynamicClient,
 			deployer.discoveryRESTMapper, desc, deployer.recorder, true, deployer.ResourceCallbackHandler)
 	}
@@ -177,13 +177,22 @@ func (deployer *Deployer) ResourceCallbackHandler(resource *unstructured.Unstruc
 
 func (deployer *Deployer) handleResource(ownedByValue string) error {
 	// get description ns and name
+	klog.Infof("handle handleResource [%s]", ownedByValue)
 	parts := strings.Split(ownedByValue, ".")
 	if len(parts) < 2 {
 		return fmt.Errorf("unexpected value for annotation %s: %s", known.ObjectOwnedByDescriptionAnnotation, ownedByValue)
 	}
 	// namespace contains no ".", while name does
 	namespace := parts[0]
-	name := strings.TrimPrefix(ownedByValue, namespace+".")
+	name_event := strings.Split(parts[1], "/")
+	name := ""
+	event := ""
+	if len(name_event) < 2 {
+		name = strings.TrimPrefix(ownedByValue, namespace+".")
+	} else if len(name_event) == 2 {
+		name = name_event[0]
+		event = name_event[1]
+	}
 
 	desc, err := deployer.descLister.Descriptions(namespace).Get(name)
 	if err != nil {
@@ -199,10 +208,14 @@ func (deployer *Deployer) handleResource(ownedByValue string) error {
 		return nil
 	}
 
-	err = utils.ApplyDescription(context.TODO(), deployer.clusternetClient, deployer.dynamicClient,
-		deployer.discoveryRESTMapper, desc, deployer.recorder, false, nil)
-	if err == nil {
-		klog.V(4).Infof("successfully rollback Description %s", ownedByValue)
+	if event == "updateStatus" {
+		_ = utils.SyncDescriptionStatus(deployer.clusternetClient, deployer.dynamicClient, deployer.discoveryRESTMapper, desc)
+	} else {
+		err = utils.ApplyDescription(context.TODO(), deployer.clusternetClient, deployer.dynamicClient,
+			deployer.discoveryRESTMapper, desc, deployer.recorder, false, nil)
+		if err == nil {
+			klog.V(4).Infof("successfully rollback Description %s", ownedByValue)
+		}
 	}
 	return err
 }

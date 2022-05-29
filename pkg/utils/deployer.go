@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -264,11 +265,11 @@ func UpdateHelmReleaseStatus(ctx context.Context, clusternetClient *clusternetcl
 			return nil
 		}
 		if status.Phase == release.StatusDeployed {
-			desc.Status.Phase = appsapi.DescriptionPhaseSuccess
-			desc.Status.Reason = ""
+			desc.Status.Phase.Phase = appsapi.DescriptionPhaseSuccess
+			desc.Status.Phase.Reason = ""
 		} else {
-			desc.Status.Phase = appsapi.DescriptionPhaseFailure
-			desc.Status.Reason = status.Notes
+			desc.Status.Phase.Phase = appsapi.DescriptionPhaseFailure
+			desc.Status.Phase.Reason = status.Notes
 		}
 		_, err := clusternetClient.AppsV1alpha1().Descriptions(desc.Namespace).UpdateStatus(ctx, desc, metav1.UpdateOptions{})
 		if err == nil {
@@ -306,6 +307,7 @@ type ResourceCallbackHandler func(resource *unstructured.Unstructured) error
 func ApplyDescription(ctx context.Context, clusternetClient *clusternetclientset.Clientset, dynamicClient dynamic.Interface,
 	discoveryRESTMapper meta.RESTMapper, desc *appsapi.Description, recorder record.EventRecorder, dryApply bool,
 	callbackHandler ResourceCallbackHandler) error {
+	klog.Infof("handle ApplyDescription %s.", klog.KObj(desc))
 	var allErrs []error
 	wg := sync.WaitGroup{}
 	objectsToBeDeployed := desc.Spec.Raw
@@ -385,9 +387,15 @@ func ApplyDescription(ctx context.Context, clusternetClient *clusternetclientset
 	}
 
 	// update status
-	desc.Status.Phase = statusPhase
-	desc.Status.Reason = reason
-	_, err := clusternetClient.AppsV1alpha1().Descriptions(desc.Namespace).UpdateStatus(context.TODO(), desc, metav1.UpdateOptions{})
+	descCopy := desc.DeepCopy()
+	descCopy.Status.Phase.Phase = statusPhase
+	descCopy.Status.Phase.Reason = reason
+
+	var err error
+	if !reflect.DeepEqual(desc.Status.Phase, descCopy.Status.Phase) {
+		_, err = clusternetClient.AppsV1alpha1().Descriptions(desc.Namespace).UpdateStatus(context.TODO(), descCopy, metav1.UpdateOptions{})
+		klog.Infof("ApplyDescription phaseStatus has changed, UpdateStatus. err: %s", err)
+	}
 
 	if len(allErrs) > 0 {
 		return utilerrors.NewAggregate(allErrs)
@@ -677,4 +685,77 @@ func ResourceNeedResync(current pkgruntime.Object, modified pkgruntime.Object) b
 	}
 
 	return false
+}
+
+func SyncDescriptionStatus(clusternetClient *clusternetclientset.Clientset, dynamicClient dynamic.Interface,
+	restMapper meta.RESTMapper, desc *appsapi.Description) error {
+	klog.Infof("handle SyncDescriptionStatus %s.", klog.KObj(desc))
+	descCopy := desc.DeepCopy()
+	objectsToBeDeployed := desc.Spec.Raw
+	for _, object := range objectsToBeDeployed {
+		resource := &unstructured.Unstructured{}
+		err := resource.UnmarshalJSON(object)
+		if err != nil {
+			msg := fmt.Sprintf("failed to unmarshal resource: %v", err)
+			klog.ErrorDepth(5, msg)
+			continue
+		}
+
+		restMapping, err := restMapper.RESTMapping(resource.GroupVersionKind().GroupKind(), resource.GroupVersionKind().Version)
+		if err != nil {
+			klog.Errorf("please check whether the advertised apiserver of current child cluster is accessible. %v", err)
+			return err
+		}
+
+		// Get cluster Resource
+		resourceObj, err := dynamicClient.Resource(restMapping.Resource).Namespace(resource.GetNamespace()).
+			Get(context.TODO(), resource.GetName(), metav1.GetOptions{})
+		if err != nil {
+			msg := fmt.Sprintf("failed to Get resource: %v", err)
+			klog.ErrorDepth(5, msg)
+			return err
+		}
+		manifestStatus := appsapi.ManifestStatus{
+			Feed: appsapi.Feed{
+				Kind:       resourceObj.GetKind(),
+				APIVersion: resourceObj.GetAPIVersion(),
+				Namespace:  resourceObj.GetNamespace(),
+				Name:       resourceObj.GetName(),
+			},
+		}
+		statusMap, _, err := unstructured.NestedMap(resourceObj.Object, "status")
+		if err != nil {
+			klog.Errorf("Failed to get status field from %s(%s/%s), error: %v", resourceObj.GetKind(),
+				resourceObj.GetNamespace(), resourceObj.GetName(), err)
+			return err
+		}
+		result := &unstructured.Unstructured{}
+		result.SetUnstructuredContent(statusMap)
+
+		manifestStatus.Status.Reset()
+		manifestStatus.Status.Object = result.DeepCopyObject()
+
+		// update exit feed manifeststatus
+		feedExit := false
+		for index, status := range desc.Status.ManifestStatuses {
+			if status.Feed.Namespace == manifestStatus.Feed.Namespace &&
+				status.Feed.Name == manifestStatus.Feed.Name {
+				desc.Status.ManifestStatuses[index] = *manifestStatus.DeepCopy()
+				feedExit = true
+			}
+		}
+		if !feedExit {
+			desc.Status.ManifestStatuses = append(desc.Status.ManifestStatuses, *manifestStatus.DeepCopy())
+		}
+	}
+
+	// try to update Descriptions Status
+	if !reflect.DeepEqual(desc.Status.ManifestStatuses, descCopy.Status.ManifestStatuses) {
+		_, err := clusternetClient.AppsV1alpha1().Descriptions(desc.Namespace).UpdateStatus(context.TODO(), desc, metav1.UpdateOptions{})
+		klog.Infof("SyncDescriptionStatus Descriptions manifestStatus has changed, UpdateStatus. err: %s", err)
+	} else {
+		klog.Infof("SyncDescriptionStatus Descriptions manifestStatus does not change, no need to Update.")
+	}
+
+	return nil
 }
