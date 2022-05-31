@@ -18,6 +18,7 @@ package deployer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -27,6 +28,8 @@ import (
 	"helm.sh/helm/v3/pkg/getter"
 	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/repo"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -42,10 +46,12 @@ import (
 	corev1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	utilpointer "k8s.io/utils/pointer"
 
 	appsapi "github.com/clusternet/clusternet/pkg/apis/apps/v1alpha1"
+	"github.com/clusternet/clusternet/pkg/controllers/apps/aggregatestatus"
 	"github.com/clusternet/clusternet/pkg/controllers/apps/base"
 	"github.com/clusternet/clusternet/pkg/controllers/apps/feedinventory"
 	"github.com/clusternet/clusternet/pkg/controllers/apps/helmchart"
@@ -69,6 +75,15 @@ var (
 	deletePropagationBackground = metav1.DeletePropagationBackground
 )
 
+const (
+	// DeploymentKind defined resource is a deployment
+	DeploymentKind = "Deployment"
+	// StatefulSetKind defined resource is a statefulset
+	StatefulSetKind = "StatefulSet"
+	// JobKind defined resource is a job
+	JobKind = "Job"
+)
+
 // Deployer defines configuration for the application deployer
 type Deployer struct {
 	chartLister applisters.HelmChartLister
@@ -88,14 +103,16 @@ type Deployer struct {
 	nsLister    corev1lister.NamespaceLister
 	nsSynced    cache.InformerSynced
 
-	clusternetClient *clusternetclientset.Clientset
-	kubeClient       *kubernetes.Clientset
+	clusternetClient        *clusternetclientset.Clientset
+	kubeClient              *kubernetes.Clientset
+	kubectlClusternetclient *kubernetes.Clientset
 
-	subsController  *subscription.Controller
-	mfstController  *manifest.Controller
-	baseController  *base.Controller
-	chartController *helmchart.Controller
-	finvController  *feedinventory.Controller
+	subsController            *subscription.Controller
+	mfstController            *manifest.Controller
+	baseController            *base.Controller
+	chartController           *helmchart.Controller
+	finvController            *feedinventory.Controller
+	aggregatestatusController *aggregatestatus.Controller
 
 	helmDeployer    *helm.Deployer
 	genericDeployer *generic.Deployer
@@ -114,31 +131,32 @@ type Deployer struct {
 func NewDeployer(apiserverURL, systemNamespace, reservedNamespace string,
 	kubeclient *kubernetes.Clientset, clusternetclient *clusternetclientset.Clientset,
 	clusternetInformerFactory clusternetinformers.SharedInformerFactory, kubeInformerFactory kubeinformers.SharedInformerFactory,
-	recorder record.EventRecorder, anonymousAuthSupported bool) (*Deployer, error) {
+	recorder record.EventRecorder, anonymousAuthSupported bool, kubectlClusternetclient *kubernetes.Clientset) (*Deployer, error) {
 	feedInUseProtection := utilfeature.DefaultFeatureGate.Enabled(features.FeedInUseProtection)
 
 	deployer := &Deployer{
-		apiserverURL:      apiserverURL,
-		reservedNamespace: reservedNamespace,
-		chartLister:       clusternetInformerFactory.Apps().V1alpha1().HelmCharts().Lister(),
-		chartSynced:       clusternetInformerFactory.Apps().V1alpha1().HelmCharts().Informer().HasSynced,
-		descLister:        clusternetInformerFactory.Apps().V1alpha1().Descriptions().Lister(),
-		descSynced:        clusternetInformerFactory.Apps().V1alpha1().Descriptions().Informer().HasSynced,
-		baseLister:        clusternetInformerFactory.Apps().V1alpha1().Bases().Lister(),
-		baseSynced:        clusternetInformerFactory.Apps().V1alpha1().Bases().Informer().HasSynced,
-		mfstLister:        clusternetInformerFactory.Apps().V1alpha1().Manifests().Lister(),
-		mfstSynced:        clusternetInformerFactory.Apps().V1alpha1().Manifests().Informer().HasSynced,
-		subLister:         clusternetInformerFactory.Apps().V1alpha1().Subscriptions().Lister(),
-		subSynced:         clusternetInformerFactory.Apps().V1alpha1().Subscriptions().Informer().HasSynced,
-		finvLister:        clusternetInformerFactory.Apps().V1alpha1().FeedInventories().Lister(),
-		finvSynced:        clusternetInformerFactory.Apps().V1alpha1().FeedInventories().Informer().HasSynced,
-		locLister:         clusternetInformerFactory.Apps().V1alpha1().Localizations().Lister(),
-		locSynced:         clusternetInformerFactory.Apps().V1alpha1().Localizations().Informer().HasSynced,
-		nsLister:          kubeInformerFactory.Core().V1().Namespaces().Lister(),
-		nsSynced:          kubeInformerFactory.Core().V1().Namespaces().Informer().HasSynced,
-		clusternetClient:  clusternetclient,
-		kubeClient:        kubeclient,
-		recorder:          recorder,
+		apiserverURL:            apiserverURL,
+		reservedNamespace:       reservedNamespace,
+		chartLister:             clusternetInformerFactory.Apps().V1alpha1().HelmCharts().Lister(),
+		chartSynced:             clusternetInformerFactory.Apps().V1alpha1().HelmCharts().Informer().HasSynced,
+		descLister:              clusternetInformerFactory.Apps().V1alpha1().Descriptions().Lister(),
+		descSynced:              clusternetInformerFactory.Apps().V1alpha1().Descriptions().Informer().HasSynced,
+		baseLister:              clusternetInformerFactory.Apps().V1alpha1().Bases().Lister(),
+		baseSynced:              clusternetInformerFactory.Apps().V1alpha1().Bases().Informer().HasSynced,
+		mfstLister:              clusternetInformerFactory.Apps().V1alpha1().Manifests().Lister(),
+		mfstSynced:              clusternetInformerFactory.Apps().V1alpha1().Manifests().Informer().HasSynced,
+		subLister:               clusternetInformerFactory.Apps().V1alpha1().Subscriptions().Lister(),
+		subSynced:               clusternetInformerFactory.Apps().V1alpha1().Subscriptions().Informer().HasSynced,
+		finvLister:              clusternetInformerFactory.Apps().V1alpha1().FeedInventories().Lister(),
+		finvSynced:              clusternetInformerFactory.Apps().V1alpha1().FeedInventories().Informer().HasSynced,
+		locLister:               clusternetInformerFactory.Apps().V1alpha1().Localizations().Lister(),
+		locSynced:               clusternetInformerFactory.Apps().V1alpha1().Localizations().Informer().HasSynced,
+		nsLister:                kubeInformerFactory.Core().V1().Namespaces().Lister(),
+		nsSynced:                kubeInformerFactory.Core().V1().Namespaces().Informer().HasSynced,
+		clusternetClient:        clusternetclient,
+		kubeClient:              kubeclient,
+		kubectlClusternetclient: kubectlClusternetclient,
+		recorder:                recorder,
 	}
 
 	helmChartController, err := helmchart.NewController(clusternetclient,
@@ -218,6 +236,15 @@ func NewDeployer(apiserverURL, systemNamespace, reservedNamespace string,
 	}
 	deployer.finvController = finv
 
+	aggregatestatusController, err := aggregatestatus.NewController(clusternetclient,
+		clusternetInformerFactory.Apps().V1alpha1().Subscriptions(),
+		clusternetInformerFactory.Apps().V1alpha1().Descriptions(),
+		deployer.recorder,
+		deployer.handleAggregateStatus)
+	if err != nil {
+		return nil, err
+	}
+	deployer.aggregatestatusController = aggregatestatusController
 	return deployer, nil
 }
 
@@ -246,6 +273,7 @@ func (deployer *Deployer) Run(workers int, stopCh <-chan struct{}) {
 	go deployer.mfstController.Run(workers, stopCh)
 	go deployer.baseController.Run(workers, stopCh)
 	go deployer.localizer.Run(workers, stopCh)
+	go deployer.aggregatestatusController.Run(workers, stopCh)
 
 	// When using external FeedInventory controller, this feature gate should be closed
 	if utilfeature.DefaultFeatureGate.Enabled(features.FeedInventory) {
@@ -306,6 +334,228 @@ func (deployer *Deployer) handleSubscription(sub *appsapi.Subscription) error {
 	}
 
 	return nil
+}
+
+func (deployer *Deployer) handleAggregateStatus(sub *appsapi.Subscription) error {
+	klog.Infof("handle AggregateStatus %s", klog.KObj(sub))
+	if sub.DeletionTimestamp != nil {
+		return nil
+	}
+
+	aggregatedStatuses, err := deployer.descriptionStatusChanged(sub)
+	if err == nil {
+		if aggregatedStatuses != nil {
+			subStatus := sub.Status.DeepCopy()
+			subStatus.AggregatedStatuses = aggregatedStatuses
+
+			err = deployer.updateSubscriptionStatus(sub, subStatus)
+			if err != nil {
+				klog.Errorf("Failed to aggregate baseStatus to Subscriptions(%s/%s). Error: %v.", sub.Namespace, sub.Name, err)
+				deployer.recorder.Event(sub, corev1.EventTypeWarning, "AggregateStatusFailed", err.Error())
+			} else {
+				msg := fmt.Sprintf("Update Subscriptions(%s/%s) with AggregatedStatus successfully.", sub.Namespace, sub.Name)
+				deployer.recorder.Event(sub, corev1.EventTypeNormal, "AggregateStatusSucceed", msg)
+				err = deployer.aggregateFeedsStatus(sub)
+			}
+		} else {
+			klog.V(5).Infof("AggregateStatus %s does not change, skip it.", klog.KObj(sub))
+		}
+	}
+	return err
+}
+
+func (deployer *Deployer) aggregateFeedsStatus(sub *appsapi.Subscription) error {
+	var errs []error
+	for _, AggregatedStatus := range sub.Status.AggregatedStatuses {
+		klog.V(5).Infof("sync resource status(%s/%s/%s)", AggregatedStatus.Kind, AggregatedStatus.Namespace, AggregatedStatus.Name)
+		switch AggregatedStatus.Kind {
+		case DeploymentKind:
+			err := deployer.AggregateDeploymentStatus(AggregatedStatus)
+			errs = append(errs, err)
+		case StatefulSetKind:
+			err := deployer.AggregateStatefulSetStatus(AggregatedStatus)
+			errs = append(errs, err)
+		case JobKind:
+			err := deployer.AggregateJobStatus(AggregatedStatus)
+			errs = append(errs, err)
+		default:
+			klog.V(5).Infof("unsupport kind(%s) resource(%s/%s), skip.", AggregatedStatus.Kind, AggregatedStatus.Namespace, AggregatedStatus.Name)
+		}
+	}
+
+	if len(errs) > 0 {
+		return utilerrors.NewAggregate(errs)
+	}
+	return nil
+}
+
+func (deployer *Deployer) descriptionStatusChanged(sub *appsapi.Subscription) ([]appsapi.AggregatedStatus, error) {
+	allExistingDescs, listErr := deployer.descLister.List(labels.SelectorFromSet(labels.Set{
+		known.ConfigSubscriptionNameLabel:      sub.Name,
+		known.ConfigSubscriptionNamespaceLabel: sub.Namespace,
+		known.ConfigSubscriptionUIDLabel:       string(sub.UID),
+	}))
+	if listErr != nil {
+		return nil, listErr
+	}
+
+	aggregatedStatusMap, clusterIndexMap, err := deployer.initaggregatedStatusMap(sub)
+	if err != nil {
+		return nil, err
+	}
+	for _, desc := range allExistingDescs {
+		if desc.DeletionTimestamp != nil {
+			continue
+		}
+
+		for _, manifeststatus := range desc.Status.ManifestStatuses {
+			feedStatus := appsapi.FeedStatus{
+				Available: true,
+			}
+
+			ReplicaStatus, err := deployer.getWorkloadReplicaStatus(manifeststatus)
+			if err != nil {
+				return nil, err
+			}
+			if ReplicaStatus != nil {
+				feedStatus.ReplicaStatus = *ReplicaStatus
+			}
+
+			feedStatusOneCluster := appsapi.FeedStatusPerCluster{
+				ClusterID:   types.UID(desc.Labels[known.ClusterIDLabel]),
+				ClusterName: desc.Labels[known.ClusterNameLabel],
+				FeedStatus:  feedStatus,
+			}
+			aggregatedStatus, hasfeed := aggregatedStatusMap[manifeststatus.Feed]
+			index, hasindex := clusterIndexMap[string(feedStatusOneCluster.ClusterID)+"/"+feedStatusOneCluster.ClusterName]
+			if !hasindex || !hasfeed {
+				return nil, fmt.Errorf("error hasfeed: %t, hasindex: %t", hasfeed, hasindex)
+			}
+			aggregatedStatus.FeedStatusDetails[index] = feedStatusOneCluster
+		}
+	}
+
+	NewaggregatedStatusMap := deployer.GeneratefeedStatusSummary(aggregatedStatusMap)
+
+	values := make([]appsapi.AggregatedStatus, 0)
+	for _, feed := range sub.Spec.Feeds {
+		values = append(values, *NewaggregatedStatusMap[feed])
+	}
+
+	if reflect.DeepEqual(sub.Status.AggregatedStatuses, values) {
+		klog.V(4).Infof("New aggregatedStatuses are equal with old subscription(%s/%s) AggregatedStatus, no update required.",
+			sub.Namespace, sub.Name)
+		return nil, nil
+	}
+	return values, nil
+}
+
+func (deployer *Deployer) initaggregatedStatusMap(sub *appsapi.Subscription) (map[appsapi.Feed]*appsapi.AggregatedStatus, map[string]int, error) {
+	initAggregatedStatusMap := make(map[appsapi.Feed]*appsapi.AggregatedStatus, 0)
+	initFeedStatusDetails := make([]appsapi.FeedStatusPerCluster, 0)
+	clusterIndexMap := make(map[string]int, 0)
+	for _, binding := range sub.Status.BindingClusters {
+		parts := strings.Split(binding, "/")
+		if len(parts) < 2 {
+			continue
+		}
+		namespace := parts[0]
+		name := parts[1]
+		managedCluster, err := deployer.clusternetClient.ClustersV1beta1().ManagedClusters(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			klog.Errorf("failed to list ManagedCluster in namespace %s: %v", namespace, err)
+			return nil, nil, err
+		}
+		initFeedStatusDetails = append(initFeedStatusDetails, appsapi.FeedStatusPerCluster{
+			ClusterID:   managedCluster.Spec.ClusterID,
+			ClusterName: name,
+		})
+	}
+	for _, feed := range sub.Spec.Feeds {
+		feedStatusDetails := make([]appsapi.FeedStatusPerCluster, len(initFeedStatusDetails))
+		copy(feedStatusDetails, initFeedStatusDetails)
+		initAggregatedStatusMap[feed] = &appsapi.AggregatedStatus{
+			Feed:              feed,
+			FeedStatusDetails: feedStatusDetails,
+		}
+	}
+
+	for index, oneCluster := range initFeedStatusDetails {
+		clusterIndexMap[string(oneCluster.ClusterID)+"/"+oneCluster.ClusterName] = index
+	}
+	return initAggregatedStatusMap, clusterIndexMap, nil
+}
+
+func (deployer *Deployer) GeneratefeedStatusSummary(aggregatedStatusMap map[appsapi.Feed]*appsapi.AggregatedStatus) map[appsapi.Feed]*appsapi.AggregatedStatus {
+	newaggregatedStatusMap := make(map[appsapi.Feed]*appsapi.AggregatedStatus, 0)
+	for feed, aggregatedStatus := range aggregatedStatusMap {
+		feedStatus := appsapi.FeedStatus{
+			Available: true,
+		}
+		for _, feedStatusOneCluster := range aggregatedStatus.FeedStatusDetails {
+			feedStatus.Available = feedStatus.Available && feedStatusOneCluster.Available
+			feedStatus.Replicas += feedStatusOneCluster.Replicas
+			feedStatus.UpdatedReplicas += feedStatusOneCluster.UpdatedReplicas
+			feedStatus.CurrentReplicas += feedStatusOneCluster.CurrentReplicas
+			feedStatus.ReadyReplicas += feedStatusOneCluster.ReadyReplicas
+			feedStatus.AvailableReplicas += feedStatusOneCluster.AvailableReplicas
+			feedStatus.UnavailableReplicas += feedStatusOneCluster.UnavailableReplicas
+			feedStatus.Active += feedStatusOneCluster.Active
+			feedStatus.Succeeded += feedStatusOneCluster.Succeeded
+			feedStatus.Failed += feedStatusOneCluster.Failed
+
+			if feedStatusOneCluster.ObservedGeneration > feedStatus.ObservedGeneration {
+				feedStatus.ObservedGeneration = feedStatusOneCluster.ObservedGeneration
+			}
+		}
+		newaggregatedStatusMap[feed] = &appsapi.AggregatedStatus{
+			Feed:              feed,
+			FeedStatusSummary: feedStatus,
+			FeedStatusDetails: aggregatedStatus.DeepCopy().FeedStatusDetails,
+		}
+	}
+
+	return newaggregatedStatusMap
+}
+
+func (deployer *Deployer) getWorkloadReplicaStatus(manifeststatus appsapi.ManifestStatus) (*appsapi.ReplicaStatus, error) {
+	switch manifeststatus.Kind {
+	case DeploymentKind:
+		return deployer.getDeploymentReplicaStatus(manifeststatus)
+	case StatefulSetKind:
+		return deployer.getStatefulSetReplicaStatus(manifeststatus)
+	case JobKind:
+		return deployer.getJobReplicaStatus(manifeststatus)
+	default:
+		klog.V(5).Infof("unsupport kind(%s) resource(%s/%s) current, skip.",
+			manifeststatus.Kind, manifeststatus.Namespace, manifeststatus.Name)
+	}
+	return nil, nil
+}
+
+func (deployer *Deployer) updateSubscriptionStatus(sub *appsapi.Subscription, status *appsapi.SubscriptionStatus) error {
+	// NEVER modify objects from the store. It's a read-only, local cache.
+	// You can use DeepCopy() to make a deep copy of original object and modify this copy
+	// Or create a copy manually for better performance
+
+	klog.V(5).Infof("try to update Subscription %q status", sub.Name)
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		sub.Status = *status
+		_, err := deployer.clusternetClient.AppsV1alpha1().Subscriptions(sub.Namespace).UpdateStatus(context.TODO(), sub, metav1.UpdateOptions{})
+		if err == nil {
+			//TODO
+			return nil
+		}
+
+		if updated, err := deployer.subLister.Subscriptions(sub.Namespace).Get(sub.Name); err == nil {
+			// make a copy so we don't mutate the shared cache
+			sub = updated.DeepCopy()
+		} else {
+			utilruntime.HandleError(fmt.Errorf("error getting updated Subscription %q from lister: %v", sub.Name, err))
+		}
+		return err
+	})
 }
 
 // populateBasesAndLocalizations will populate a group of Base(s) from Subscription.
@@ -1232,4 +1482,188 @@ func (deployer *Deployer) protectHelmChartFeed(chart *appsapi.HelmChart) error {
 	// finalizer FeedProtectionFinalizer does not exist,
 	// so we just remove this feed from all Subscriptions
 	return removeFeedFromAllMatchingSubscriptions(deployer.clusternetClient, allRelatedSubscriptions, chart.Labels)
+}
+
+func (deployer *Deployer) getDeploymentReplicaStatus(manifeststatus appsapi.ManifestStatus) (*appsapi.ReplicaStatus, error) {
+	if manifeststatus.APIVersion != "apps/v1" {
+		return nil, fmt.Errorf("feed %s  apiVersion is not apps/v1", manifeststatus.Feed)
+	}
+
+	temp := &appsv1.DeploymentStatus{}
+	if err := json.Unmarshal(manifeststatus.ObservedStatus.Raw, temp); err != nil {
+		klog.Errorf("Failed to unmarshal ObservedStatus status")
+		return nil, err
+	}
+	klog.V(3).Infof("Get deployment(%s/%s) status, replicas: %d, ready: %d, updated: %d, available: %d, unavailable: %d",
+		manifeststatus.Namespace, manifeststatus.Name, temp.Replicas, temp.ReadyReplicas, temp.UpdatedReplicas,
+		temp.AvailableReplicas, temp.UnavailableReplicas)
+
+	replicaStatus := &appsapi.ReplicaStatus{
+		ObservedGeneration:  temp.ObservedGeneration,
+		Replicas:            temp.Replicas,
+		UpdatedReplicas:     temp.UpdatedReplicas,
+		ReadyReplicas:       temp.ReadyReplicas,
+		AvailableReplicas:   temp.AvailableReplicas,
+		UnavailableReplicas: temp.UnavailableReplicas,
+	}
+
+	return replicaStatus, nil
+}
+
+func (deployer *Deployer) getStatefulSetReplicaStatus(manifeststatus appsapi.ManifestStatus) (*appsapi.ReplicaStatus, error) {
+	if manifeststatus.APIVersion != "apps/v1" {
+		return nil, fmt.Errorf("feed %s  apiVersion is not apps/v1", manifeststatus.Feed)
+	}
+
+	temp := &appsv1.StatefulSetStatus{}
+	if err := json.Unmarshal(manifeststatus.ObservedStatus.Raw, temp); err != nil {
+		klog.Errorf("Failed to unmarshal status")
+		return nil, err
+	}
+	klog.V(3).Infof("Get StatefulSet(%s/%s) status, replicas: %d, ready: %d, updated: %d",
+		manifeststatus.Namespace, manifeststatus.Name, temp.Replicas, temp.ReadyReplicas, temp.UpdatedReplicas)
+
+	replicaStatus := &appsapi.ReplicaStatus{
+		ObservedGeneration: temp.ObservedGeneration,
+		Replicas:           temp.Replicas,
+		UpdatedReplicas:    temp.UpdatedReplicas,
+		CurrentReplicas:    temp.CurrentReplicas,
+		ReadyReplicas:      temp.ReadyReplicas,
+		AvailableReplicas:  temp.AvailableReplicas,
+	}
+
+	return replicaStatus, nil
+}
+
+func (deployer *Deployer) getJobReplicaStatus(manifeststatus appsapi.ManifestStatus) (*appsapi.ReplicaStatus, error) {
+	if manifeststatus.APIVersion != "batch/v1" {
+		return nil, fmt.Errorf("feed %s  apiVersion is not batch/v1", manifeststatus.Feed)
+	}
+
+	temp := &batchv1.JobStatus{}
+	if err := json.Unmarshal(manifeststatus.ObservedStatus.Raw, temp); err != nil {
+		klog.Errorf("Failed to unmarshal status")
+		return nil, err
+	}
+	klog.V(3).Infof("Get Job(%s/%s) status, Active: %d, Succeeded: %d, Failed: %d",
+		manifeststatus.Namespace, manifeststatus.Name, temp.Active, temp.Succeeded, temp.Failed)
+
+	replicaStatus := &appsapi.ReplicaStatus{
+		Active:    temp.Active,
+		Succeeded: temp.Succeeded,
+		Failed:    temp.Failed,
+	}
+
+	return replicaStatus, nil
+}
+
+func (deployer *Deployer) AggregateDeploymentStatus(status appsapi.AggregatedStatus) error {
+	if status.Feed.APIVersion != "apps/v1" {
+		return fmt.Errorf("feed %s  apiVersion is not apps/v1", status.Feed)
+	}
+
+	obj, err := deployer.kubectlClusternetclient.AppsV1().Deployments(status.Feed.Namespace).Get(context.TODO(), status.Feed.Name, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to get deployment(%s/%s): %v", status.Feed.Namespace, status.Feed.Name, err)
+		return err
+	}
+
+	oldStatus := &obj.Status
+	if oldStatus.Replicas == status.FeedStatusSummary.Replicas &&
+		oldStatus.ReadyReplicas == status.FeedStatusSummary.ReadyReplicas &&
+		oldStatus.UpdatedReplicas == status.FeedStatusSummary.UpdatedReplicas &&
+		oldStatus.AvailableReplicas == status.FeedStatusSummary.AvailableReplicas &&
+		oldStatus.UnavailableReplicas == status.FeedStatusSummary.UnavailableReplicas {
+		klog.V(3).Infof("ignore update deployment(%s/%s) status as up to date", obj.Namespace, obj.Name)
+		return nil
+	}
+
+	klog.V(3).Infof("Aggregate deployment(%s/%s) status from child clusters, replicas: %d, ready: %d, updated: %d, available: %d, unavailable: %d",
+		obj.Namespace, obj.Name, status.FeedStatusSummary.Replicas, status.FeedStatusSummary.ReadyReplicas, status.FeedStatusSummary.UpdatedReplicas,
+		status.FeedStatusSummary.AvailableReplicas, status.FeedStatusSummary.UnavailableReplicas)
+
+	oldStatus.Replicas = status.FeedStatusSummary.Replicas
+	oldStatus.ReadyReplicas = status.FeedStatusSummary.ReadyReplicas
+	oldStatus.UpdatedReplicas = status.FeedStatusSummary.UpdatedReplicas
+	oldStatus.AvailableReplicas = status.FeedStatusSummary.AvailableReplicas
+	oldStatus.UnavailableReplicas = status.FeedStatusSummary.UnavailableReplicas
+
+	if _, err = deployer.kubectlClusternetclient.AppsV1().Deployments(obj.Namespace).Update(context.TODO(), obj, metav1.UpdateOptions{}); err != nil {
+		klog.Errorf("Failed to update deployment(%s/%s) status: %v", obj.Namespace, obj.Name, err)
+		return err
+	}
+
+	return nil
+}
+
+func (deployer *Deployer) AggregateStatefulSetStatus(status appsapi.AggregatedStatus) error {
+	if status.Feed.APIVersion != "apps/v1" {
+		return nil
+	}
+
+	obj, err := deployer.kubectlClusternetclient.AppsV1().StatefulSets(status.Feed.Namespace).Get(context.TODO(), status.Feed.Name, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to get statefulset(%s/%s): %v", status.Feed.Namespace, status.Feed.Name, err)
+		return err
+	}
+
+	oldStatus := &obj.Status
+	if oldStatus.Replicas == status.FeedStatusSummary.Replicas &&
+		oldStatus.ReadyReplicas == status.FeedStatusSummary.ReadyReplicas &&
+		oldStatus.CurrentReplicas == status.FeedStatusSummary.CurrentReplicas &&
+		oldStatus.UpdatedReplicas == status.FeedStatusSummary.UpdatedReplicas &&
+		oldStatus.AvailableReplicas == status.FeedStatusSummary.AvailableReplicas {
+		klog.V(3).Infof("ignore update statefulset(%s/%s) status as up to date", obj.Namespace, obj.Name)
+		return nil
+	}
+
+	klog.V(3).Infof("Aggregate statefulset(%s/%s) status from child clusters, replicas: %d, ready: %d, updated: %d, available: %d, current: %d",
+		obj.Namespace, obj.Name, status.FeedStatusSummary.Replicas, status.FeedStatusSummary.ReadyReplicas, status.FeedStatusSummary.UpdatedReplicas,
+		status.FeedStatusSummary.AvailableReplicas, status.FeedStatusSummary.CurrentReplicas)
+
+	oldStatus.Replicas = status.FeedStatusSummary.Replicas
+	oldStatus.ReadyReplicas = status.FeedStatusSummary.ReadyReplicas
+	oldStatus.CurrentReplicas = status.FeedStatusSummary.CurrentReplicas
+	oldStatus.UpdatedReplicas = status.FeedStatusSummary.UpdatedReplicas
+	oldStatus.AvailableReplicas = status.FeedStatusSummary.AvailableReplicas
+
+	if _, err = deployer.kubectlClusternetclient.AppsV1().StatefulSets(obj.Namespace).Update(context.TODO(), obj, metav1.UpdateOptions{}); err != nil {
+		klog.Errorf("Failed to update statefulset(%s/%s) status: %v", obj.Namespace, obj.Name, err)
+		return err
+	}
+
+	return nil
+}
+
+func (deployer *Deployer) AggregateJobStatus(status appsapi.AggregatedStatus) error {
+	if status.Feed.APIVersion != "batch/v1" {
+		return nil
+	}
+
+	obj, err := deployer.kubectlClusternetclient.BatchV1().Jobs(status.Feed.Namespace).Get(context.TODO(), status.Feed.Name, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to get job(%s/%s): %v", status.Feed.Namespace, status.Feed.Name, err)
+		return err
+	}
+
+	oldStatus := &obj.Status
+	if oldStatus.Active == status.FeedStatusSummary.Active &&
+		oldStatus.Succeeded == status.FeedStatusSummary.Succeeded &&
+		oldStatus.Failed == status.FeedStatusSummary.Failed {
+		klog.V(3).Infof("ignore update Job(%s/%s) status as up to date", obj.Namespace, obj.Name)
+		return nil
+	}
+
+	klog.V(3).Infof("Aggregate Job(%s/%s) status from child clusters, active: %d, successed: %d, failed: %d",
+		obj.Namespace, obj.Name, status.FeedStatusSummary.Active, status.FeedStatusSummary.Succeeded, status.FeedStatusSummary.Failed)
+
+	oldStatus.Active = status.FeedStatusSummary.Active
+	oldStatus.Succeeded = status.FeedStatusSummary.Succeeded
+	oldStatus.Failed = status.FeedStatusSummary.Failed
+
+	if _, err = deployer.kubectlClusternetclient.BatchV1().Jobs(obj.Namespace).Update(context.TODO(), obj, metav1.UpdateOptions{}); err != nil {
+		klog.Errorf("Failed to update job(%s/%s) status: %v", obj.Namespace, obj.Name, err)
+		return err
+	}
+	return nil
 }
